@@ -1090,10 +1090,13 @@ def interactive_svg_viewer(svg_path: Path, height: int = 760) -> None:
     viewer_html = f"""
     <div id="{component_id}" class="network-viewer">
       <div class="toolbar" aria-label="网络图浏览工具">
+        <input type="search" data-role="node-search" list="{component_id}-nodes" placeholder="搜索节点，如 silk、knights、gown" aria-label="搜索网络节点">
+        <datalist id="{component_id}-nodes"></datalist>
         <button type="button" data-action="zoom-in">放大</button>
         <button type="button" data-action="zoom-out">缩小</button>
         <button type="button" data-action="reset">复位</button>
-        <span>滚轮缩放；按住拖动；双击复位</span>
+        <button type="button" data-action="clear">清除高亮</button>
+        <span data-role="status">滚轮按鼠标位置缩放；拖动画布；点击节点高亮关系</span>
       </div>
       <div class="stage" role="img" aria-label="英格兰服饰禁奢法令中的群体与服饰对象关系网络图">
         {svg_text}
@@ -1110,6 +1113,15 @@ def interactive_svg_viewer(svg_path: Path, height: int = 760) -> None:
         flex-wrap: wrap;
         gap: 0.45rem;
         margin-bottom: 0.6rem;
+      }}
+      #{component_id} input {{
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        color: #0f172a;
+        flex: 1 1 260px;
+        font-size: 0.92rem;
+        min-width: 220px;
+        padding: 0.38rem 0.6rem;
       }}
       #{component_id} button {{
         background: #f8fafc;
@@ -1146,18 +1158,65 @@ def interactive_svg_viewer(svg_path: Path, height: int = 760) -> None:
       #{component_id} svg.is-dragging {{
         cursor: grabbing;
       }}
+      #{component_id} svg circle {{
+        cursor: pointer;
+      }}
+      #{component_id} svg .dimmed {{
+        opacity: 0.08 !important;
+      }}
+      #{component_id} svg .related {{
+        opacity: 1 !important;
+      }}
+      #{component_id} svg .selected-node {{
+        stroke: #dc2626 !important;
+        stroke-width: 28px !important;
+      }}
+      #{component_id} svg .active-edge {{
+        opacity: 1 !important;
+        stroke: #dc2626 !important;
+        stroke-opacity: 0.9 !important;
+      }}
     </style>
     <script>
       (() => {{
         const root = document.getElementById("{component_id}");
         if (!root) return;
+        const stage = root.querySelector(".stage");
         const svg = root.querySelector("svg");
-        if (!svg) return;
+        const search = root.querySelector('[data-role="node-search"]');
+        const status = root.querySelector('[data-role="status"]');
+        const datalist = root.querySelector("datalist");
+        if (!stage || !svg) return;
 
         const initial = svg.getAttribute("viewBox").split(/\\s+/).map(Number);
         let viewBox = initial.slice();
         let dragging = false;
         let lastPoint = null;
+        let pointerDown = null;
+        const edges = Array.from(svg.querySelectorAll("#edges path"));
+        const nodes = Array.from(svg.querySelectorAll("#nodes circle"));
+        const labels = Array.from(svg.querySelectorAll("text"));
+
+        function nodeId(node) {{
+          return Array.from(node.classList).find((name) => name.startsWith("id_")) || "";
+        }}
+
+        function labelFor(id) {{
+          return id.replace(/^id_/, "").replace("::", ": ").replaceAll("_", " ");
+        }}
+
+        const nodeMap = new Map(nodes.map((node) => [nodeId(node), node]).filter(([id]) => id));
+        const nodeRecords = Array.from(nodeMap.keys()).map((id) => ({{
+          id,
+          label: labelFor(id),
+          plain: labelFor(id).toLowerCase()
+        }}));
+        nodeRecords.sort((a, b) => a.label.localeCompare(b.label));
+        nodeRecords.forEach((record) => {{
+          const option = document.createElement("option");
+          option.value = record.label;
+          datalist.appendChild(option);
+        }});
 
         function setViewBox(next) {{
           viewBox = next;
@@ -1179,22 +1238,29 @@ def interactive_svg_viewer(svg_path: Path, height: int = 760) -> None:
           }};
           const newWidth = viewBox[2] * factor;
           const newHeight = viewBox[3] * factor;
-          const minWidth = initial[2] / 80;
-          const maxWidth = initial[2] * 2.5;
+          const minWidth = initial[2] / 500;
+          const maxWidth = initial[2] * 4;
           if (newWidth < minWidth || newWidth > maxWidth) return;
           const x = target.x - ((target.x - viewBox[0]) / viewBox[2]) * newWidth;
           const y = target.y - ((target.y - viewBox[1]) / viewBox[3]) * newHeight;
           setViewBox([x, y, newWidth, newHeight]);
         }}
 
-        svg.addEventListener("wheel", (event) => {{
+        function zoomWheel(event) {{
           event.preventDefault();
-          zoomAt(event.deltaY < 0 ? 0.82 : 1.22, clientToSvg(event));
-        }}, {{ passive: false }});
+          event.stopPropagation();
+          const factor = Math.exp(event.deltaY * 0.0014);
+          zoomAt(factor, clientToSvg(event));
+        }}
+
+        stage.addEventListener("wheel", zoomWheel, {{ passive: false }});
+        svg.addEventListener("wheel", zoomWheel, {{ passive: false }});
 
         svg.addEventListener("pointerdown", (event) => {{
+          if (event.button !== 0) return;
           dragging = true;
           lastPoint = {{ x: event.clientX, y: event.clientY }};
+          pointerDown = {{ x: event.clientX, y: event.clientY, target: event.target }};
           svg.classList.add("is-dragging");
           svg.setPointerCapture(event.pointerId);
         }});
@@ -1214,13 +1280,89 @@ def interactive_svg_viewer(svg_path: Path, height: int = 760) -> None:
           svg.classList.remove("is-dragging");
         }}
 
-        svg.addEventListener("pointerup", stopDrag);
+        svg.addEventListener("pointerup", (event) => {{
+          const moved = pointerDown ? Math.hypot(event.clientX - pointerDown.x, event.clientY - pointerDown.y) : 0;
+          const clickedNode = event.target.closest ? event.target.closest("#nodes circle") : null;
+          stopDrag();
+          if (clickedNode && moved < 6) {{
+            selectNode(nodeId(clickedNode), true);
+          }}
+          pointerDown = null;
+        }});
         svg.addEventListener("pointercancel", stopDrag);
         svg.addEventListener("dblclick", () => setViewBox(initial.slice()));
 
-        root.querySelector('[data-action="zoom-in"]').addEventListener("click", () => zoomAt(0.82));
-        root.querySelector('[data-action="zoom-out"]').addEventListener("click", () => zoomAt(1.22));
-        root.querySelector('[data-action="reset"]').addEventListener("click", () => setViewBox(initial.slice()));
+        function clearHighlight() {{
+          edges.forEach((edge) => edge.classList.remove("dimmed", "active-edge", "related"));
+          nodes.forEach((node) => node.classList.remove("dimmed", "selected-node", "related"));
+          labels.forEach((label) => label.classList.remove("dimmed", "related"));
+          status.textContent = "滚轮按鼠标位置缩放；拖动画布；点击节点高亮关系";
+        }}
+
+        function focusNode(node, widthFactor = 18) {{
+          const cx = Number(node.getAttribute("cx"));
+          const cy = Number(node.getAttribute("cy"));
+          const newWidth = initial[2] / widthFactor;
+          const newHeight = initial[3] / widthFactor;
+          setViewBox([cx - newWidth / 2, cy - newHeight / 2, newWidth, newHeight]);
+        }}
+
+        function selectNode(id, focus = false) {{
+          if (!id || !nodeMap.has(id)) return;
+          const related = new Set([id]);
+          const activeEdges = [];
+          edges.forEach((edge) => {{
+            const classes = Array.from(edge.classList);
+            if (classes.includes(id)) {{
+              activeEdges.push(edge);
+              classes.filter((name) => name.startsWith("id_")).forEach((name) => related.add(name));
+            }}
+          }});
+          edges.forEach((edge) => {{
+            edge.classList.toggle("active-edge", activeEdges.includes(edge));
+            edge.classList.toggle("dimmed", !activeEdges.includes(edge));
+          }});
+          nodes.forEach((node) => {{
+            const current = nodeId(node);
+            node.classList.toggle("selected-node", current === id);
+            node.classList.toggle("related", related.has(current));
+            node.classList.toggle("dimmed", !related.has(current));
+          }});
+          labels.forEach((label) => {{
+            const current = nodeId(label);
+            label.classList.toggle("related", related.has(current));
+            label.classList.toggle("dimmed", current && !related.has(current));
+          }});
+          status.textContent = `${{labelFor(id)}}：相关节点 ${{Math.max(related.size - 1, 0)}} 个，相关连线 ${{activeEdges.length}} 条`;
+          if (focus) focusNode(nodeMap.get(id));
+        }}
+
+        function findRecord(value) {{
+          const query = value.trim().toLowerCase();
+          if (!query) return null;
+          return nodeRecords.find((record) => record.plain === query)
+            || nodeRecords.find((record) => record.plain.includes(query));
+        }}
+
+        search.addEventListener("change", () => {{
+          const record = findRecord(search.value);
+          if (record) selectNode(record.id, true);
+        }});
+        search.addEventListener("keydown", (event) => {{
+          if (event.key === "Enter") {{
+            event.preventDefault();
+            const record = findRecord(search.value);
+            if (record) selectNode(record.id, true);
+          }}
+        }});
+
+        root.querySelector('[data-action="zoom-in"]').addEventListener("click", () => zoomAt(0.75));
+        root.querySelector('[data-action="zoom-out"]').addEventListener("click", () => zoomAt(1.33));
+        root.querySelector('[data-action="reset"]').addEventListener("click", () => {{
+          setViewBox(initial.slice());
+          clearHighlight();
+        }});
+        root.querySelector('[data-action="clear"]').addEventListener("click", clearHighlight);
       }})();
     </script>
     """
