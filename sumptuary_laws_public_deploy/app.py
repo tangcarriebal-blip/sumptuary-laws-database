@@ -20,6 +20,7 @@ PROCESSED_DIR = ROOT / "data" / "processed"
 GEPHI_DIR = ROOT / "gephi_exports"
 VOYANT_DIR = ROOT / "voyant_exports"
 PAGE_IMAGE_DIR = ROOT / "data" / "page_images"
+NETWORK_FIGURE_DIR = ROOT / "assets" / "network_figures"
 
 
 st.set_page_config(page_title="英国禁奢法数据库", layout="wide")
@@ -1074,6 +1075,68 @@ def network_export() -> None:
         st.download_button(path.name, path.read_bytes(), path.name, "text/csv")
 
 
+def network_figures() -> None:
+    st.title("服饰与等级关系网络图")
+    st.caption(
+        "本页收录 Gephi 网络分析导出的完整预览图与专题解释图，用于直观展示禁奢法令中身份、资格依据与服饰对象之间的编码关系。"
+        "图中连线表示文本编码中的共同出现或规制关联，适合作为阅读入口；具体历史解释仍需回到原文条款核对。"
+    )
+
+    full_svg = NETWORK_FIGURE_DIR / "full_group_item_network_backup.svg"
+    full_gephi = NETWORK_FIGURE_DIR / "full_group_item_network_backup.gephi"
+
+    st.subheader("完整关系网络预览图")
+    st.caption(
+        "这一版使用备份网络文件，保留的信息更全面，适合让读者先把握整个“群体—服饰对象”关系网络的规模、中心节点和边缘节点。"
+        "由于完整网络节点较多，图像可能需要横向或放大查看；下方专题图则用于快速阅读核心关系。"
+    )
+    if full_svg.exists():
+        st.image(str(full_svg), use_container_width=True)
+        c1, c2 = st.columns(2)
+        c1.download_button("下载完整网络 SVG", full_svg.read_bytes(), full_svg.name, "image/svg+xml")
+        if full_gephi.exists():
+            c2.download_button("下载 Gephi 备份文件", full_gephi.read_bytes(), full_gephi.name, "application/octet-stream")
+    else:
+        st.warning(f"未找到完整网络 SVG：{full_svg}")
+
+    st.divider()
+    st.subheader("专题关系图")
+    st.caption("下面两张图是从完整网络中抽出的解释性视图，便于读者快速理解中间群体、资格依据与核心服饰对象的关系。")
+
+    figures = [
+        {
+            "title": "中间群体与核心服饰对象关系图",
+            "path": NETWORK_FIGURE_DIR / "figure1_middle_groups_core_items_revised.png",
+            "caption": (
+                "展示骑士、乡绅、绅士、市政官员等中间群体与丝绸、天鹅绒、缎、貂皮、长袍、袜裤等核心服饰对象的关系。"
+                "它有助于观察禁奢法令如何在王室贵族之外继续划分可见的社会等级。"
+            ),
+        },
+        {
+            "title": "资格依据与服饰对象关系图",
+            "path": NETWORK_FIGURE_DIR / "figure2_qualification_items_revised.png",
+            "caption": (
+                "展示土地收入、租金收入、动产、官职、王室服务、家庭隶属关系、教士收入等资格依据与服饰对象的关系。"
+                "它有助于理解禁奢法令并不只按身份名号规制，也通过财产、职位和服务关系来界定穿着资格。"
+            ),
+        },
+    ]
+
+    for figure in figures:
+        st.subheader(figure["title"])
+        st.caption(figure["caption"])
+        if figure["path"].exists():
+            st.image(str(figure["path"]), use_container_width=True)
+            st.download_button(
+                f"下载{figure['title']}",
+                figure["path"].read_bytes(),
+                figure["path"].name,
+                "image/png",
+            )
+        else:
+            st.warning(f"未找到图片文件：{figure['path']}")
+
+
 def voyant_export() -> None:
     st.title("Voyant 语料导出")
     metadata = VOYANT_DIR / "voyant_metadata.csv"
@@ -1102,6 +1165,7 @@ def main() -> None:
         "序言证据": preamble_evidence,
         "原文图文浏览": original_text_browser,
         "分析面板": analysis_dashboard,
+        "关系网络图": network_figures,
         "网络文件导出": network_export,
         "Voyant 语料导出": voyant_export,
         "数据质量": data_quality,
