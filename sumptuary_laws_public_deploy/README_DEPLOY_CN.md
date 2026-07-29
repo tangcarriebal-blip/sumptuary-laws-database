@@ -1,4 +1,4 @@
-# 英国禁奢法数据库公网部署说明
+# 英格兰禁奢法令数据库公网部署说明
 
 这个文件夹是可部署版本，用于把本地 Streamlit 数据库发布成一个所有人都能打开的网址。
 
@@ -43,4 +43,3 @@ app.py
 cd path\to\sumptuary_laws_public_deploy
 python -m streamlit run app.py --server.port 8501
 ```
-

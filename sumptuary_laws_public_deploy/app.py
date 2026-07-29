@@ -24,7 +24,7 @@ PAGE_IMAGE_DIR = ROOT / "data" / "page_images"
 NETWORK_FIGURE_DIR = ROOT / "assets" / "network_figures"
 
 
-st.set_page_config(page_title="英国禁奢法数据库", layout="wide")
+st.set_page_config(page_title="英格兰禁奢法令数据库", layout="wide")
 st.markdown(
     """
     <style>
@@ -604,7 +604,7 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def home() -> None:
-    st.title("英国禁奢法数据库，1337-1604")
+    st.title("英格兰禁奢法令数据库，1337-1604")
     st.write("研究主题：作为物质语言的服饰、身份编码、法律分类、材料属性、法律关切，以及序言/理由说明中的规范话语。")
     st.caption("平台说明：这是一个本地运行的 Streamlit 网页应用，底层数据库为 SQLite。所有数据文件保存在本机项目文件夹中，不是线上网站，也不会自动上传到外部服务器。")
     if DB_PATH.exists():
