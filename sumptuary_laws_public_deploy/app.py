@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -212,6 +213,21 @@ def download_buttons(df: pd.DataFrame, stem: str) -> None:
     col1, col2 = st.columns(2)
     col1.download_button("下载 CSV", df.to_csv(index=False).encode("utf-8-sig"), f"{stem}.csv", "text/csv")
     col2.download_button("下载 Excel", to_excel_bytes(df), f"{stem}.xlsx")
+
+
+def zip_bytes(files: dict[str, bytes | str]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, content in files.items():
+            data = content.encode("utf-8") if isinstance(content, str) else content
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def safe_filename(value: object, fallback: str) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[^\w\-]+", "_", text, flags=re.UNICODE).strip("_")
+    return text[:80] or fallback
 
 
 def ensure_db() -> bool:
@@ -1065,15 +1081,161 @@ def analysis_dashboard() -> None:
             st.dataframe(compare, use_container_width=True)
 
 
-def network_export() -> None:
-    st.title("网络文件导出")
-    files = sorted(GEPHI_DIR.glob("*.csv"))
-    if st.button("重新生成 Gephi/Voyant 导出文件"):
-        subprocess.run([sys.executable, str(ROOT / "scripts" / "export_analysis.py")], check=False)
-        st.cache_data.clear()
-        st.rerun()
-    for path in files:
-        st.download_button(path.name, path.read_bytes(), path.name, "text/csv")
+def build_network_exports() -> dict[str, pd.DataFrame]:
+    items = read_table("regulated_items")
+    if items.empty:
+        empty = pd.DataFrame()
+        return {"nodes": empty, "edges": empty, "matrix": empty, "items": empty}
+
+    edge_rows = []
+    for _, row in items.iterrows():
+        item = str(row.get("item_name_normalized") or row.get("item_name_original") or "").strip()
+        if not item or item == "not specified":
+            continue
+        group_text = str(row.get("regulated_group_standardized") or row.get("regulated_group_original") or "")
+        groups = [g.strip() for g in re.split(r";|,", group_text) if g.strip() and g.strip() != "not specified"]
+        if not groups:
+            groups = ["not specified"]
+        for group in groups:
+            edge_rows.append(
+                {
+                    "source": f"group::{group}",
+                    "target": f"item::{item}",
+                    "source_label": group,
+                    "target_label": item,
+                    "law_year": row.get("law_year"),
+                    "source_family": row.get("source_family"),
+                    "law_id": row.get("law_id"),
+                    "item_id": row.get("item_id"),
+                }
+            )
+    edge_base = pd.DataFrame(edge_rows)
+    if edge_base.empty:
+        empty = pd.DataFrame()
+        return {"nodes": empty, "edges": empty, "matrix": empty, "items": items}
+
+    edges = (
+        edge_base.groupby(["source", "target", "source_label", "target_label"], dropna=False)
+        .agg(
+            weight=("item_id", "count"),
+            years=("law_year", lambda s: "; ".join(str(x) for x in sorted(set(s.dropna())))),
+            source_families=("source_family", lambda s: "; ".join(sorted(set(s.dropna().astype(str))))),
+            law_ids=("law_id", lambda s: "; ".join(sorted(set(s.dropna().astype(str))))),
+        )
+        .reset_index()
+    )
+    nodes_group = edges[["source", "source_label"]].rename(columns={"source": "id", "source_label": "label"})
+    nodes_group["type"] = "regulated_group"
+    nodes_item = edges[["target", "target_label"]].rename(columns={"target": "id", "target_label": "label"})
+    nodes_item["type"] = "regulated_item"
+    nodes = pd.concat([nodes_group, nodes_item], ignore_index=True).drop_duplicates("id")
+    degree_counts = pd.concat(
+        [
+            edges[["source", "weight"]].rename(columns={"source": "id"}),
+            edges[["target", "weight"]].rename(columns={"target": "id"}),
+        ],
+        ignore_index=True,
+    ).groupby("id", as_index=False)["weight"].sum().rename(columns={"weight": "weighted_degree"})
+    nodes = nodes.merge(degree_counts, on="id", how="left").sort_values(["type", "weighted_degree"], ascending=[True, False])
+
+    matrix = pd.crosstab(edge_base["source_label"], edge_base["target_label"])
+    matrix.index.name = "regulated_group"
+    matrix = matrix.reset_index()
+    return {"nodes": nodes, "edges": edges, "matrix": matrix, "items": items}
+
+
+def build_voyant_exports() -> tuple[pd.DataFrame, dict[str, bytes | str]]:
+    sources = read_table("sources")
+    files: dict[str, bytes | str] = {}
+    metadata_rows = []
+    for _, row in sources.iterrows():
+        source_id = str(row.get("source_id") or "source")
+        year = str(row.get("law_year") or "unknown")
+        title = str(row.get("source_title") or source_id)
+        raw_text = str(row.get("cleaned_text") or row.get("full_text") or "")
+        cn_text = str(row.get("chinese_translation") or "")
+        base = f"{year}_{safe_filename(source_id, 'source')}_{safe_filename(title, 'text')}"
+        if raw_text.strip():
+            files[f"raw_cleaned_text/{base}.txt"] = raw_text
+            normalized = re.sub(r"\s+", " ", raw_text.lower()).strip()
+            files[f"normalized_text/{base}.txt"] = normalized
+        if cn_text.strip() and cn_text != "not specified":
+            files[f"chinese_translation/{base}.txt"] = cn_text
+        metadata_rows.append(
+            {
+                "source_id": source_id,
+                "law_year": row.get("law_year"),
+                "monarch": row.get("monarch"),
+                "source_family": row.get("source_family"),
+                "source_title": title,
+                "source_reference": row.get("source_reference"),
+                "raw_file": f"raw_cleaned_text/{base}.txt" if raw_text.strip() else "",
+                "normalized_file": f"normalized_text/{base}.txt" if raw_text.strip() else "",
+                "chinese_file": f"chinese_translation/{base}.txt" if cn_text.strip() and cn_text != "not specified" else "",
+            }
+        )
+    metadata = pd.DataFrame(metadata_rows)
+    files["voyant_metadata.csv"] = metadata.to_csv(index=False).encode("utf-8-sig")
+    return metadata, files
+
+
+def data_export() -> None:
+    st.title("数据导出")
+    st.caption("将原来的“网络文件导出”和“Voyant 语料导出”合并到一个页面。下载文件由当前 SQLite 数据库即时生成，线上部署后也可以直接点击下载。")
+
+    tabs = st.tabs(["网络分析文件", "Voyant 语料", "数据库表格"])
+
+    with tabs[0]:
+        st.subheader("Gephi / 网络分析文件")
+        st.caption("节点表用于定义受限制群体与服饰对象；边表表示二者在规制物品记录中的关联，weight 为共同出现记录数。")
+        exports = build_network_exports()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("节点数", len(exports["nodes"]))
+        c2.metric("边数", len(exports["edges"]))
+        c3.metric("原始物品记录", len(exports["items"]))
+
+        if exports["edges"].empty:
+            st.info("当前数据库没有可生成网络文件的物品记录。")
+        else:
+            preview = exports["edges"].sort_values("weight", ascending=False).head(30)
+            st.dataframe(display_df(preview), use_container_width=True)
+            files = {
+                "gephi_nodes.csv": exports["nodes"].to_csv(index=False).encode("utf-8-sig"),
+                "gephi_edges.csv": exports["edges"].to_csv(index=False).encode("utf-8-sig"),
+                "group_item_matrix.csv": exports["matrix"].to_csv(index=False).encode("utf-8-sig"),
+                "network_source_items.csv": exports["items"].to_csv(index=False).encode("utf-8-sig"),
+            }
+            st.download_button("下载网络分析文件 ZIP", zip_bytes(files), "sumptuary_network_exports.zip", "application/zip")
+            col1, col2 = st.columns(2)
+            col1.download_button("下载 Gephi 节点 CSV", files["gephi_nodes.csv"], "gephi_nodes.csv", "text/csv")
+            col2.download_button("下载 Gephi 边 CSV", files["gephi_edges.csv"], "gephi_edges.csv", "text/csv")
+
+    with tabs[1]:
+        st.subheader("Voyant 语料")
+        st.caption("导出来源文本为 Voyant 可读取的 txt 语料，并附元数据 CSV。raw_cleaned_text 保留清理后文本；normalized_text 为小写与空白规范化版本。")
+        metadata, files = build_voyant_exports()
+        c1, c2 = st.columns(2)
+        c1.metric("来源文本数", len(metadata))
+        c2.metric("语料文件数", len([name for name in files if name.endswith(".txt")]))
+        st.dataframe(display_df(metadata), use_container_width=True)
+        st.download_button("下载 Voyant 语料 ZIP", zip_bytes(files), "voyant_corpus_exports.zip", "application/zip")
+        st.download_button("下载 Voyant 元数据 CSV", files["voyant_metadata.csv"], "voyant_metadata.csv", "text/csv")
+
+    with tabs[2]:
+        st.subheader("数据库表格")
+        st.caption("下载当前网页使用的核心 SQLite 表格，便于论文复核、二次统计或备份。")
+        table_names = ["sources", "law_rules", "regulated_items", "preambles", "original_text_pages", "notes_or_uncertain_records"]
+        selected = st.multiselect("选择要导出的表", table_names, default=["sources", "law_rules", "regulated_items"])
+        if selected:
+            files = {}
+            for table in selected:
+                if table_exists(table):
+                    df = read_table(table)
+                    files[f"{table}.csv"] = df.to_csv(index=False).encode("utf-8-sig")
+                    st.write(f"**{table}**：{len(df)} 条记录")
+            st.download_button("下载所选表格 ZIP", zip_bytes(files), "sumptuary_database_tables.zip", "application/zip")
+        else:
+            st.info("请选择至少一个表。")
 
 
 def interactive_svg_viewer(svg_path: Path, height: int = 760) -> None:
@@ -1431,15 +1593,6 @@ def network_figures() -> None:
             st.warning(f"未找到图片文件：{figure['path']}")
 
 
-def voyant_export() -> None:
-    st.title("Voyant 语料导出")
-    metadata = VOYANT_DIR / "voyant_metadata.csv"
-    if metadata.exists():
-        st.dataframe(display_df(pd.read_csv(metadata)), use_container_width=True)
-        st.download_button("下载元数据 CSV", metadata.read_bytes(), "voyant_metadata.csv")
-    st.write(f"语料文件夹：`{VOYANT_DIR / 'raw_cleaned_text'}` 与 `{VOYANT_DIR / 'normalized_text'}`")
-
-
 def data_quality() -> None:
     st.title("数据质量")
     notes = read_table("notes_or_uncertain_records")
@@ -1460,8 +1613,7 @@ def main() -> None:
         "原文图文浏览": original_text_browser,
         "分析面板": analysis_dashboard,
         "关系网络图": network_figures,
-        "网络文件导出": network_export,
-        "Voyant 语料导出": voyant_export,
+        "数据导出": data_export,
         "数据质量": data_quality,
     }
     page = st.sidebar.radio(
