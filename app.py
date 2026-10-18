@@ -609,7 +609,7 @@ def home() -> None:
     cols[1].metric("待核验规则记录数", m["pending_rules"])
     cols[2].metric("待核验有效对象记录数", m["pending_active_objects"])
     st.caption(f"对象原行共 {m['all_objects']} 条，其中 {m['inactive_objects']} 条身份误编码停用，仍可在数据质量页追溯。旧版 67 个来源未混入第二轮 28 个来源。")
-    st.info("关系片段已核、字段检查通过、整条史料校勘完成是不同状态。数据库尚未全部校勘，表3库存和表5已核下限均不是全库最终统计。")
+    st.info("关系片段已核、字段检查通过、整条史料校勘完成是不同状态。")
     st.write("1363年研究采用法文：较富裕侍从200英镑；下阶骑士200马克；商人动产超过1000英镑，比照年土地／地租收入200英镑群体。法文、英译异文及依据均保留。")
     st.caption("来源分议会法令、王室公告、枢密院执行条款、法令摘要。No493、No496在扩展来源统计另列；不同来源的重申不自动算创新。")
 
@@ -901,11 +901,11 @@ def render_year_snapshot(selected_year: int, year_items: pd.DataFrame, all_items
 def analysis_dashboard() -> None:
     st.title("分析面板")
     st.warning("以下频率和年度图是有效对象／规则记录的字段层库存，未认证为历史最终统计；部位筛选仅明示部位。原来源类型已分四类，不跨来源合并重申。")
-    with st.expander("表3库存与表5已核下限及口径"):
+    with st.expander("服饰对象分类与组合关系统计口径"):
         st.dataframe(read_table("audit_t3_summary"), use_container_width=True)
-        st.caption("表3为含边缘原料／贸易记录的库存，不能当作核心身份服饰最终数。")
+        st.caption("对象分类统计包含边缘原料／贸易记录，不能当作核心身份服饰最终数。")
         st.dataframe(read_table("audit_t5_summary"), use_container_width=True)
-        st.caption("表5严格口径排除No493枢密院执行条款及No496法令摘要；同来源保守规范单元去重，各类可重合，最终总数为空。")
+        st.caption("组合关系统计的严格口径排除No493枢密院执行条款及No496法令摘要；同来源保守规范单元去重，各类可重合，最终总数为空。")
         st.dataframe(read_table("audit_t5_extended"), use_container_width=True)
     sources = read_table("sources")
     items = read_table("regulated_items")
