@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+*.tmp.db
+*.db-journal
+*.db-wal
+*.db-shm
+.streamlit/secrets.toml
+/sumptuary_laws.db
+/data/round2/
+*.round2.tmp

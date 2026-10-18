@@ -7,24 +7,28 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
+import round2_data as r2
 
 
 ROOT = Path(__file__).resolve().parent
+from bootstrap_round2 import ensure_payload
+ensure_payload(ROOT)
 DB_PATH = ROOT / "sumptuary_laws.db"
 PROCESSED_DIR = ROOT / "data" / "processed"
 GEPHI_DIR = ROOT / "gephi_exports"
 VOYANT_DIR = ROOT / "voyant_exports"
 PAGE_IMAGE_DIR = ROOT / "data" / "page_images"
-NETWORK_FIGURE_DIR = ROOT / "assets" / "network_figures"
+NETWORK_FIGURE_DIR = ROOT / "sumptuary_laws_public_deploy" / "assets" / "network_figures"
 
 
-st.set_page_config(page_title="英国禁奢法数据库", layout="wide")
+st.set_page_config(page_title="英格兰禁奢法令数据库", layout="wide")
 st.markdown(
     """
     <style>
@@ -154,6 +158,8 @@ FIELD_LABELS = {
     "duration": "持续时间",
 }
 
+FIELD_LABELS.update(r2.LABELS)
+
 FILTER_LABELS = {
     "monarch": "君主",
     "source_family": "来源系列",
@@ -177,28 +183,31 @@ FILTER_LABELS = {
 
 
 def display_df(df: pd.DataFrame) -> pd.DataFrame:
+    important = [c for c in ["item_id", "law_id", "source_id", "law_year", "source_family", "regulated_group_original", "research_threshold", "french_threshold", "english_threshold", "variant_note", "threshold_adoption_basis", "threshold_text_status", "source_text_locator", "text_verification_status", "object_classes", "garment_part_explicit", "body_part_explicit", "record_active"] if c in df]
+    df = df[important + [c for c in df if c not in important]]
+    if st.session_state.get("field_language", "中文") == "English":
+        return df
     return df.rename(columns={col: FIELD_LABELS.get(col, col) for col in df.columns})
 
 
-def read_table(table: str) -> pd.DataFrame:
-    db_mtime = DB_PATH.stat().st_mtime if DB_PATH.exists() else 0
-    return _read_table(table, db_mtime)
 
+def read_table(table: str, include_inactive: bool = False) -> pd.DataFrame:
+    return _read_table(table, r2.stamp(DB_PATH), include_inactive)
 
-@st.cache_data(show_spinner=False)
-def _read_table(table: str, db_mtime: float) -> pd.DataFrame:
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
-    conn.close()
-    return df
 
 
 @st.cache_data(show_spinner=False)
+def _read_table(table: str, db_version: tuple, include_inactive: bool = False) -> pd.DataFrame:
+    return r2.read(DB_PATH, table, include_inactive)
+
+
+
 def table_exists(table: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+    with sqlite3.connect(DB_PATH) as conn:
+        exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
     conn.close()
     return exists
+
 
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -217,8 +226,9 @@ def download_buttons(df: pd.DataFrame, stem: str) -> None:
 def ensure_db() -> bool:
     if DB_PATH.exists():
         return True
-    st.error("没有找到数据库。请先运行 `python scripts/build_database.py`。")
+    st.error("第二轮数据库尚未就位。请部署已测试的数据库文件；不要运行旧版自动导入脚本覆盖修订数据。")
     return False
+
 
 
 def search_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
@@ -395,13 +405,8 @@ def top_clean_values(series: pd.Series, limit: int = 3) -> list[str]:
 
 
 def canonical_text_count(sources: pd.DataFrame) -> int:
-    if sources.empty or "source_title" not in sources.columns:
-        return 0
-    key_cols = [col for col in ["law_year", "source_family", "source_title"] if col in sources.columns]
-    keys = sources[key_cols].copy()
-    for col in key_cols:
-        keys[col] = keys[col].map(clean_category).str.lower().str.replace(r"\s+", " ", regex=True)
-    return int(keys.drop_duplicates().shape[0])
+    return int(sources["source_id"].nunique()) if "source_id" in sources else 0
+
 
 
 def distinctive_values(year_values: pd.Series, overall_values: pd.Series, limit: int = 3) -> list[str]:
@@ -481,7 +486,7 @@ def build_yearly_overview(sources: pd.DataFrame, laws: pd.DataFrame, items: pd.D
         rows.append(
             {
                 "年份": year,
-                "原始法令文本数": canonical_text_count(year_sources),
+                "来源单元数": canonical_text_count(year_sources),
                 "整理记录数": int(year_sources["source_id"].nunique()) if "source_id" in year_sources.columns else 0,
                 "法律规则数": int(len(year_laws)),
                 "规制物品记录数": int(len(year_items)),
@@ -489,7 +494,7 @@ def build_yearly_overview(sources: pd.DataFrame, laws: pd.DataFrame, items: pd.D
                 "涉及群体数": int(year_items["regulated_group_standardized"].map(clean_category).replace("", pd.NA).nunique()) if "regulated_group_standardized" in year_items.columns else 0,
                 "君主": "；".join(top_clean_values(year_laws.get("monarch", pd.Series(dtype=object)), 3)),
                 "来源系列": "；".join(top_clean_values(year_laws.get("source_family", pd.Series(dtype=object)), 3)),
-                "原始法令标题": source_title_list(year_sources),
+                "来源标题": source_title_list(year_sources),
                 "群体/身份词线索": primary_group_list(year_items),
                 "群体线索摘要": group_structure_summary(year_items),
                 "主要规制物品": "；".join(top_clean_values(year_items.get("item_name_normalized", pd.Series(dtype=object)), 5)),
@@ -572,50 +577,42 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
         if "law_year" in df.columns and df["law_year"].notna().any():
             years = pd.to_numeric(df["law_year"], errors="coerce")
             lo, hi = int(years.min()), int(years.max())
-            year_range = st.slider("年份范围", lo, hi, (lo, hi))
-            df = df[(years >= year_range[0]) & (years <= year_range[1])]
-        for col in [
-            "monarch",
-            "source_family",
-            "source_type",
-            "regulated_group_standardized",
-            "group_category",
-            "item_type",
-            "item_name_normalized",
-            "material",
-            "colour",
-            "fur_type",
-            "garment_form",
-            "body_location",
-            "production_or_origin",
-            "material_property_primary",
-            "legal_concern_primary",
-            "allowed_or_prohibited",
-            "penalty_type",
-            "data_confidence",
-        ]:
-            if col in df.columns:
-                values = sorted(v for v in df[col].dropna().astype(str).unique() if v)
-                if values:
-                    selected = st.multiselect(FILTER_LABELS.get(col, col), values)
-                    if selected:
-                        df = df[df[col].astype(str).isin(selected)]
+            if lo < hi:
+                year_range = st.slider("年份范围", lo, hi, (lo, hi))
+                df = df[years.between(*year_range)]
+        if "research_threshold" in df:
+            income = st.text_input("研究采用门槛关键词", help="例如 200、GBP、marks；不自动兑换英镑和马克。详细异文见法文／英译门槛列。")
+            if income:
+                df = df[df.research_threshold.astype(str).str.contains(income, case=False, regex=False, na=False)]
+        multiple = {"material", "colour", "fur_type", "garment_form", "ornament_type", "object_classes", "garment_part_explicit", "body_part_explicit"}
+        for col in ["monarch", "source_family", "source_type", "regulated_group_standardized", "group_category", "research_threshold", "threshold_basis", "object_classes", "item_type", "item_name_normalized", "material", "colour", "fur_type", "garment_form", "ornament_type", "garment_part_explicit", "body_part_explicit", "production_or_origin", "material_property_primary", "legal_concern_primary", "allowed_or_prohibited", "rule_function", "penalty_type", "threshold_text_status", "text_verification_status", "data_confidence"]:
+            if col not in df:
+                continue
+            values = sorted({v for cell in df[col].dropna() for v in (r2.tokens(cell) if col in multiple else [str(cell)]) if clean_category(v)})
+            if values:
+                selected = st.multiselect(FILTER_LABELS.get(col, FIELD_LABELS.get(col, col)), values)
+                df = r2.filter_values(df, col, selected, col in multiple)
     return df
 
 
+
 def home() -> None:
-    st.title("英国禁奢法数据库，1337-1604")
-    st.write("研究主题：作为物质语言的服饰、身份编码、法律分类、材料属性、法律关切，以及序言/理由说明中的规范话语。")
-    st.caption("平台说明：这是一个本地运行的 Streamlit 网页应用，底层数据库为 SQLite。所有数据文件保存在本机项目文件夹中，不是线上网站，也不会自动上传到外部服务器。")
-    if DB_PATH.exists():
-        sources = read_table("sources")
-        laws = read_table("law_rules")
-        items = read_table("regulated_items")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("来源记录", len(sources))
-        c2.metric("法律规则", len(laws))
-        c3.metric("规制物品", len(items))
-    st.info("自动导入的数据是研究起点。正式引用前，请核对原文摘录、中文译文和分析编码。")
+    st.title("英格兰禁奢法令数据库，1337—1604")
+    st.caption("第二轮史料与数据修订 · " + r2.VERSION)
+    m = r2.metrics(DB_PATH)
+    cols = st.columns(3)
+    cols[0].metric("来源单元数", m["source_units"])
+    cols[1].metric("规则记录数", m["rule_records"])
+    cols[2].metric("有效对象记录数", m["active_objects"])
+    cols = st.columns(3)
+    cols[0].metric("已核原文关系片段（含辅助来源）", m["verified_relation_fragments"])
+    cols[1].metric("待核验规则记录数", m["pending_rules"])
+    cols[2].metric("待核验有效对象记录数", m["pending_active_objects"])
+    st.caption(f"对象原行共 {m['all_objects']} 条，其中 {m['inactive_objects']} 条身份误编码停用，仍可在数据质量页追溯。旧版 67 个来源未混入第二轮 28 个来源。")
+    st.info("关系片段已核、字段检查通过、整条史料校勘完成是不同状态。数据库尚未全部校勘，表3库存和表5已核下限均不是全库最终统计。")
+    st.write("1363年研究采用法文：较富裕侍从200英镑；下阶骑士200马克；商人动产超过1000英镑，比照年土地／地租收入200英镑群体。法文、英译异文及依据均保留。")
+    st.caption("来源分议会法令、王室公告、枢密院执行条款、法令摘要。No493、No496在扩展来源统计另列；不同来源的重申不自动算创新。")
+
 
 
 def keyword_search() -> None:
@@ -688,6 +685,11 @@ def browse_sources() -> None:
         st.subheader(row.source_title)
         st.write({FIELD_LABELS.get(k, k): v for k, v in row.to_dict().items()})
         st.text_area("清理后文本", row.cleaned_text or row.full_text, height=300)
+        if selected == "EDW-III-1363-STAT":
+            with zipfile.ZipFile(ROOT / "data" / "round2" / "第二轮复算与证据包.zip") as evidence:
+                image = evidence.read("evidence/SR_p381_image9.png")
+            st.caption("所给印本p381：法文200英镑／200马克，英译异文另列；此图不代表其余印本均已校勘。")
+            st.image(image, caption="The Statutes of the Realm, p381（第二轮证据包）")
 
 
 def browse_items() -> None:
@@ -704,6 +706,7 @@ def browse_items() -> None:
 
 def preamble_evidence() -> None:
     st.title("序言证据")
+    st.caption("旧版辅助证据及旧来源编号保留，关联legacy_sources，尚未逐条对应第二轮来源；不得与新28来源直接按ID合并。")
     q = st.text_input("检索序言/理由说明", value="estate")
     df = search_df(read_table("preambles"), q)
     st.dataframe(display_df(df), use_container_width=True)
@@ -711,6 +714,7 @@ def preamble_evidence() -> None:
 
 
 def original_text_browser() -> None:
+    st.caption("原页面层保留旧版文献编号与页码；新规则以source_text_locator追溯。仅凭年份不自动匹配来源，未打包的本机PDF云端仍不可访问。")
     st.title("原文图文浏览")
     st.caption("用于按年份或关键词浏览禁奢法令原文。默认优先显示 PDF 原书页；下方文本会高亮关键词，方便定位命中位置。")
     if not table_exists("original_text_pages"):
@@ -886,7 +890,7 @@ def render_year_snapshot(selected_year: int, year_items: pd.DataFrame, all_items
         st.dataframe(display_df(lifecycle.sort_values("records", ascending=False).head(20)), use_container_width=True)
 
     st.markdown("**成文法与公告的法律关切对比**")
-    st.caption("行区分 Statute / Proclamation，列为主要法律关切；数值表示该年的规制物品记录数。")
+    st.caption("行区分 议会法令／王室公告／枢密院执行条款／法令摘要，列为主要法律关切；数值表示该年的规制物品记录数。")
     compare = pd.crosstab(year_items["source_family"], year_items["legal_concern_primary"])
     if compare.empty:
         st.info("该年没有可生成法律关切对比的数据。")
@@ -896,6 +900,13 @@ def render_year_snapshot(selected_year: int, year_items: pd.DataFrame, all_items
 
 def analysis_dashboard() -> None:
     st.title("分析面板")
+    st.warning("以下频率和年度图是有效对象／规则记录的字段层库存，未认证为历史最终统计；部位筛选仅明示部位。原来源类型已分四类，不跨来源合并重申。")
+    with st.expander("表3库存与表5已核下限及口径"):
+        st.dataframe(read_table("audit_t3_summary"), use_container_width=True)
+        st.caption("表3为含边缘原料／贸易记录的库存，不能当作核心身份服饰最终数。")
+        st.dataframe(read_table("audit_t5_summary"), use_container_width=True)
+        st.caption("表5严格口径排除No493枢密院执行条款及No496法令摘要；同来源保守规范单元去重，各类可重合，最终总数为空。")
+        st.dataframe(read_table("audit_t5_extended"), use_container_width=True)
     sources = read_table("sources")
     items = read_table("regulated_items")
     laws = read_table("law_rules")
@@ -920,7 +931,7 @@ def analysis_dashboard() -> None:
     tabs = st.tabs(["年度概览", "频率统计", "时间线", "矩阵", "对象生命周期", "法律关切"])
     with tabs[0]:
         st.subheader("每年禁奢法令数量与特点")
-        st.caption("“原始法令文本数”按同一年、同标题、同来源系列合并统计；同一年同标题下的 Statute 与 Proclamation 会分开计算，因为它们出自不同文本类型。“整理记录数”是 Word 表格或数据库拆分后的技术记录数，不等于法令份数。“法律规则数”按数据库中的具体规则条目统计。年度特点摘要基于该年与总体分布的差异自动生成，适合作为读者导览，正式论证前仍建议回到原文核对。")
+        st.caption("“来源单元数”按同一年、同标题、同来源系列合并统计；同一年同标题下的 Statute 与 Proclamation 会分开计算，因为它们出自不同文本类型。“整理记录数”是 Word 表格或数据库拆分后的技术记录数，不等于法令份数。“法律规则数”按数据库中的具体规则条目统计。年度特点摘要基于该年与总体分布的差异自动生成，适合作为读者导览，正式论证前仍建议回到原文核对。")
         if not yearly.empty:
             st.info(overall_group_structure_text(yearly, items))
         c1, c2, c3, c4 = st.columns(4)
@@ -934,7 +945,7 @@ def analysis_dashboard() -> None:
                     yearly,
                     x="年份",
                     y="法律规则数",
-                    hover_data=["原始法令文本数", "整理记录数", "规制物品种类数", "涉及群体数", "群体/身份词线索", "群体线索摘要", "主要规制物品", "年度特点摘要"],
+                    hover_data=["来源单元数", "整理记录数", "规制物品种类数", "涉及群体数", "群体/身份词线索", "群体线索摘要", "主要规制物品", "年度特点摘要"],
                     title="各年份法律规则数量",
                     labels={"法律规则数": "法律规则数", "年份": "年份"},
                 ),
@@ -942,7 +953,7 @@ def analysis_dashboard() -> None:
             )
             display_cols = [
                 "年份",
-                "原始法令文本数",
+                "来源单元数",
                 "整理记录数",
                 "法律规则数",
                 "规制物品种类数",
@@ -950,7 +961,7 @@ def analysis_dashboard() -> None:
                 "群体/身份词线索",
                 "群体线索摘要",
                 "主要规制物品",
-                "原始法令标题",
+                "来源标题",
                 "年度特点摘要",
             ]
             st.dataframe(yearly[[col for col in display_cols if col in yearly.columns]], use_container_width=True)
@@ -973,12 +984,12 @@ def analysis_dashboard() -> None:
                 detail_cols[1].write(
                     {
                         "主要规制物品": selected["主要规制物品"] or "暂无",
-                        "原始法令标题": selected["原始法令标题"] or "暂无",
+                        "来源标题": selected["来源标题"] or "暂无",
                     }
                 )
                 detail_cols[2].write(
                     {
-                        "原始法令文本数": int(selected["原始法令文本数"]),
+                        "来源单元数": int(selected["来源单元数"]),
                         "整理记录数": int(selected["整理记录数"]),
                         "来源系列": selected["来源系列"] or "暂无",
                         "君主": selected["君主"] or "暂无",
@@ -990,12 +1001,18 @@ def analysis_dashboard() -> None:
                 if not scoped_laws.empty:
                     st.subheader(f"{selected_year} 年法律规则")
                     st.caption("该表列出这一年拆分出的具体法律规则，便于从年度结构回到单条规则和原文摘录。")
-                    law_cols = ["law_id", "source_id", "law_year", "monarch", "article_no", "article_heading", "source_excerpt", "chinese_summary"]
+                    law_cols = ["law_id", "source_id", "law_year", "monarch", "research_threshold", "french_threshold", "english_threshold", "variant_note", "threshold_adoption_basis", "threshold_text_status", "source_text_locator", "text_verification_status", "article_no", "article_heading", "source_excerpt", "chinese_summary"]
                     st.dataframe(display_df(scoped_laws[[col for col in law_cols if col in scoped_laws.columns]]), use_container_width=True)
     with tabs[1]:
         st.subheader(f"{scope_label} 高频规制对象统计")
         st.caption("显示当前分析范围内出现频率最高的物品、材料、颜色、毛皮和服饰形制。")
         for col in ["item_name_normalized", "item_type", "material", "fur_type", "colour", "garment_form"]:
+            code = {"material": "MAT", "fur_type": "FUR", "colour": "COL", "garment_form": "FORM"}.get(col)
+            if code:
+                counts = r2.feature_counts(scoped_items, read_table("audit_t3_features"), code)
+                if not counts.empty:
+                    st.plotly_chart(px.bar(counts, x="count", y="value", orientation="h", title=f"{scope_label}：{FIELD_LABELS.get(col, col)}（正式分类库存）", labels={"value": FIELD_LABELS.get(col, col), "count": "对象记录覆盖数"}), use_container_width=True)
+                continue
             counts = scoped_items[col].replace("not specified", pd.NA).replace("", pd.NA).dropna().value_counts().head(20).reset_index()
             if counts.empty:
                 continue
@@ -1011,7 +1028,7 @@ def analysis_dashboard() -> None:
             year_source_counts = scoped_items["source_family"].replace("", pd.NA).dropna().value_counts().reset_index()
             year_source_counts.columns = ["source_family", "count"]
             if not year_source_counts.empty:
-                st.plotly_chart(px.bar(year_source_counts, x="source_family", y="count", title=f"{scope_label} Statute / Proclamation 记录构成", labels={"source_family": "来源系列", "count": "数量"}), use_container_width=True)
+                st.plotly_chart(px.bar(year_source_counts, x="source_family", y="count", title=f"{scope_label} 议会法令／王室公告／枢密院执行条款／法令摘要 记录构成", labels={"source_family": "来源系列", "count": "数量"}), use_container_width=True)
     with tabs[3]:
         st.subheader(f"{scope_label} 群体/身份词线索-规制物品矩阵")
         st.caption("行表示自动识别到的群体/身份词线索，列表示规制物品；单元格数值表示该线索与物品在当前年份范围内共同出现的记录数。该矩阵用于提示回读原文的方向，不直接判定谁是主要受限对象。")
@@ -1057,7 +1074,7 @@ def analysis_dashboard() -> None:
             counts.columns = [col, "count"]
             st.plotly_chart(px.bar(counts, x=col, y="count", title=f"{scope_label}：{FIELD_LABELS.get(col, col)}", labels={col: FIELD_LABELS.get(col, col), "count": "数量"}), use_container_width=True)
         st.subheader(f"{scope_label} 成文法与公告的法律关切对比")
-        st.caption("行区分 Statute / Proclamation，列为主要法律关切；数值表示当前年份范围内的规制物品记录数。")
+        st.caption("行区分 议会法令／王室公告／枢密院执行条款／法令摘要，列为主要法律关切；数值表示当前年份范围内的规制物品记录数。")
         compare = pd.crosstab(scoped_items["source_family"], scoped_items["legal_concern_primary"])
         if compare.empty:
             st.info("当前年份范围内没有可生成对比表的数据。")
@@ -1067,13 +1084,13 @@ def analysis_dashboard() -> None:
 
 def network_export() -> None:
     st.title("网络文件导出")
-    files = sorted(GEPHI_DIR.glob("*.csv"))
-    if st.button("重新生成 Gephi/Voyant 导出文件"):
-        subprocess.run([sys.executable, str(ROOT / "scripts" / "export_analysis.py")], check=False)
-        st.cache_data.clear()
-        st.rerun()
-    for path in files:
-        st.download_button(path.name, path.read_bytes(), path.name, "text/csv")
+    st.caption("由第二轮有效对象即时生成。边权按同群体—对象的不同law_id去重；law_id仍是规则记录单位，并非已确认的独立法理规范总数。")
+    nodes, edges = r2.network_frames(read_table("regulated_items"))
+    st.dataframe(edges.head(100), use_container_width=True)
+    st.download_button("下载当前 Gephi CSV ZIP", r2.zip_frames({"gephi_nodes.csv": nodes, "gephi_edges.csv": edges}), "round2_gephi.zip", "application/zip")
+    download_buttons(nodes, "round2_gephi_nodes")
+    download_buttons(edges, "round2_gephi_edges")
+
 
 
 def interactive_svg_viewer(svg_path: Path, height: int = 760) -> None:
@@ -1369,7 +1386,7 @@ def interactive_svg_viewer(svg_path: Path, height: int = 760) -> None:
     components.html(viewer_html, height=height + 70, scrolling=False)
 
 
-def network_figures() -> None:
+def _legacy_network_figures() -> None:
     st.title("服饰与等级关系网络图")
     st.caption(
         "本页收录 Gephi 网络分析导出的完整预览图与专题解释图，用于直观展示禁奢法令中身份、资格依据与服饰对象之间的编码关系。"
@@ -1433,21 +1450,44 @@ def network_figures() -> None:
 
 def voyant_export() -> None:
     st.title("Voyant 语料导出")
-    metadata = VOYANT_DIR / "voyant_metadata.csv"
-    if metadata.exists():
-        st.dataframe(display_df(pd.read_csv(metadata)), use_container_width=True)
-        st.download_button("下载元数据 CSV", metadata.read_bytes(), "voyant_metadata.csv")
-    st.write(f"语料文件夹：`{VOYANT_DIR / 'raw_cleaned_text'}` 与 `{VOYANT_DIR / 'normalized_text'}`")
+    st.caption("导出第二轮规则摘录汇集，按来源分文件；不是原法令完整全文，也未以研究采用值改写原文中的英译异文。")
+    metadata, data = r2.voyant_bytes(read_table("sources"))
+    st.dataframe(display_df(metadata), use_container_width=True)
+    st.download_button("下载第二轮摘录语料 ZIP", data, "round2_voyant_excerpts.zip", "application/zip")
+    download_buttons(metadata, "round2_voyant_metadata")
+
 
 
 def data_quality() -> None:
     st.title("数据质量")
-    notes = read_table("notes_or_uncertain_records")
-    st.dataframe(display_df(notes), use_container_width=True)
-    report = PROCESSED_DIR / "data_quality_report.xlsx"
-    if report.exists():
-        st.download_button("下载数据质量报告", report.read_bytes(), "data_quality_report.xlsx")
+    st.info("本页保留停用对象、修改日志、缺对象复核及来源口径。待核验不得视为正确；原文关系已核不表示整条门槛、处罚或执行字段全部通过。")
+    st.dataframe(display_df(read_table("notes_or_uncertain_records")), use_container_width=True)
+    with st.expander("停用对象与历史追溯"):
+        all_items = read_table("regulated_items", include_inactive=True)
+        st.dataframe(display_df(all_items[all_items.record_active.eq(0)]), use_container_width=True)
+        download_buttons(all_items, "round2_all_objects_with_inactive")
+        st.caption("旧67来源、808规则、1179对象完整保存在SQLite的legacy_*表；原始编号未与新编号猜测匹配。")
+        legacy = ROOT / "sumptuary_laws_public_deploy" / "sumptuary_laws_public_deploy_updated_1463_1482_title" / "sumptuary_laws.db"
+        st.download_button("下载迁移前SQLite快照（历史版）", legacy.read_bytes(), "legacy_before_round2.db", key="legacy_database_download")
+    with st.expander("第二轮逐字段修改日志"):
+        log = read_table("audit_revision_log")
+        st.dataframe(log, use_container_width=True)
+        download_buttons(log, "round2_change_log")
+    with st.expander("108条缺对象候选逐条复核"):
+        st.dataframe(read_table("audit_missing_objects"), use_container_width=True)
+    st.subheader("第二轮资料下载")
+    for path in sorted((ROOT / "data" / "round2").iterdir()):
+        if path.is_file():
+            st.download_button(path.name, path.read_bytes(), path.name, key="round2_download_" + path.name)
 
+
+
+
+def network_figures() -> None:
+    st.title("关系网络图")
+    st.warning("原静态网络图来自旧版数据，暂不作为第二轮统计展示；当前数据请使用网络文件导出。旧图仅供历史追溯。")
+    if st.checkbox("查看历史网络图（非第二轮统计）"):
+        _legacy_network_figures()
 
 def main() -> None:
     pages = {
@@ -1464,6 +1504,8 @@ def main() -> None:
         "Voyant 语料导出": voyant_export,
         "数据质量": data_quality,
     }
+    st.sidebar.selectbox("显示字段语言 / Field labels", ["中文", "English"], key="field_language")
+    st.sidebar.caption(r2.VERSION + " · 未完成全库校勘")
     page = st.sidebar.radio(
         "页面",
         list(pages.keys()),
